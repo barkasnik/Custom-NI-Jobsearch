@@ -23,6 +23,9 @@ def clean_text(text):
 
 
 def compute_scores(cv_text, jobs):
+    if not jobs:
+        return []
+
     documents = [cv_text] + [job["description"].lower() for job in jobs]
     vectorizer = TfidfVectorizer(stop_words="english")
     tfidf = vectorizer.fit_transform(documents)
@@ -42,7 +45,7 @@ def compute_scores(cv_text, jobs):
 
 
 st.title("NI Job Matcher (Super Simple Version)")
-st.write("Upload your CV or paste text. Shows NI jobs from Adzuna + Civil Service NI.")
+st.write("Upload your CV or paste text. Shows NI jobs from Adzuna + Civil Service NI (RSS).")
 
 option = st.radio("CV Input Method", ["Upload PDF", "Paste Text"])
 
@@ -71,7 +74,7 @@ if st.button("Find Jobs"):
             jobs = get_all_jobs()
 
         if not jobs:
-            st.warning("No jobs found.")
+            st.warning("No jobs found or sources unavailable.")
         else:
             scored = compute_scores(cv_clean, jobs)
             st.subheader("Job Matches")
