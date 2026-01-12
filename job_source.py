@@ -2,13 +2,20 @@
 
 import os
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup  # kept in case you want it later
+import feedparser
 
 ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID", "")
 ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY", "")
 
 
 def get_adzuna_jobs():
+    """
+    Fetch jobs from Adzuna limited to Northern Ireland.
+    """
+    if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
+        return []
+
     url = (
         "https://api.adzuna.com/v1/api/jobs/gb/search/1"
         f"?app_id={ADZUNA_APP_ID}"
@@ -19,65 +26,73 @@ def get_adzuna_jobs():
     )
 
     try:
-        resp = requests.get(url)
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
         data = resp.json()
-    except:
+    except Exception:
         return []
 
     jobs = []
     for item in data.get("results", []):
-        jobs.append({
-            "title": item.get("title", "Unknown"),
-            "company": item.get("company", {}).get("display_name", "Unknown"),
-            "location": item.get("location", {}).get("display_name", "Northern Ireland"),
-            "salary": item.get("salary_min") or 0,
-            "description": item.get("description", ""),
-            "url": item.get("redirect_url", ""),
-            "source": "Adzuna"
-        })
+        jobs.append(
+            {
+                "title": item.get("title", "Unknown"),
+                "company": item.get("company", {}).get("display_name", "Unknown"),
+                "location": item.get("location", {}).get("display_name", "Northern Ireland"),
+                "salary": item.get("salary_min") or 0,
+                "description": item.get("description", ""),
+                "url": item.get("redirect_url", ""),
+                "source": "Adzuna",
+            }
+        )
     return jobs
 
 
 def get_civil_service_jobs_ni():
-    url = (
-        "https://www.civilservicejobs.service.gov.uk/csr/index.cgi"
-        "?action=advanced_search&location=2"
-    )
+    """
+    Fetch Civil Service jobs via RSS and filter to Northern Ireland.
+    """
+    feed_url = "https://www.civilservicejobs.service.gov.uk/csr/index.cgi/rss"
 
     try:
-        resp = requests.get(url)
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except:
+        feed = feedparser.parse(feed_url)
+    except Exception:
         return []
 
     jobs = []
-    rows = soup.select("div.search-result")
-
-    for row in rows:
-        title_tag = row.select_one("a.search-result-title")
-        if not title_tag:
+    for entry in feed.entries:
+        # Some feeds use custom fields; we guard with .get
+        location = getattr(entry, "location", "") or entry.get("location", "")
+        if not location:
+            # Sometimes location might be in the summary or title, but we keep it simple.
             continue
 
-        title = title_tag.get_text(strip=True)
-        link = title_tag.get("href", "")
-        if link and not link.startswith("http"):
-            link = "https://www.civilservicejobs.service.gov.uk" + link
+        if "northern ireland" not in location.lower():
+            continue
 
-        org = row.select_one("div.search-result-organisation")
-        loc = row.select_one("div.search-result-location")
+        title = entry.title
+        link = entry.link
+        description = getattr(entry, "summary", "") or entry.get("summary", "")
 
-        jobs.append({
-            "title": title,
-            "company": org.get_text(strip=True) if org else "Civil Service",
-            "location": loc.get_text(strip=True) if loc else "Northern Ireland",
-            "salary": 0,
-            "description": "Civil Service NI role. See link for details.",
-            "url": link,
-            "source": "Civil Service NI"
-        })
+        jobs.append(
+            {
+                "title": title,
+                "company": "Civil Service",
+                "location": location,
+                "salary": 0,  # RSS doesn’t reliably expose salary
+                "description": description,
+                "url": link,
+                "source": "Civil Service NI",
+            }
+        )
 
     return jobs
 
 
 def get_all_jobs():
-    return get_adzuna_jobs() + get_civil_service_jobs_ni()
+    """
+    Combine Adzuna and Civil Service NI jobs.
+    """
+    adzuna_jobs = get_adzuna_jobs()
+    civil_jobs = get_civil_service_jobs_ni()
+    return adzuna_jobs + civil_jobs
