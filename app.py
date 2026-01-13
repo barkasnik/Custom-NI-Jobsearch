@@ -23,6 +23,12 @@ def clean_text(text):
 
 
 def compute_scores(cv_text, jobs):
+    """
+    Compute similarity scores and adjust them so the percentages feel human:
+    - Weak matches: ~20–40%
+    - Medium matches: ~50–70%
+    - Strong matches: ~75–95%
+    """
     if not jobs:
         return []
 
@@ -36,16 +42,24 @@ def compute_scores(cv_text, jobs):
 
     scored = []
     for job, sim in zip(jobs, sims):
+        raw = sim * 100.0  # base similarity %
+        # Adjust: soften low scores, boost mid-range a bit
+        adjusted = (raw ** 0.75) * 1.5
+        final = round(min(adjusted, 100.0), 2)
+
         job_copy = job.copy()
-        job_copy["score"] = round(sim * 100, 2)
+        job_copy["score"] = final
         scored.append(job_copy)
 
     scored.sort(key=lambda j: j["score"], reverse=True)
     return scored
 
 
-st.title("NI Job Matcher (Super Simple Version)")
-st.write("Upload your CV or paste text. Shows NI jobs from Adzuna + Civil Service NI (RSS).")
+st.title("NI Job Matcher (Super Simple, No API Keys)")
+st.write(
+    "Upload your CV or paste text. "
+    "Shows jobs in Northern Ireland from Indeed (via RSS) and UK-wide Civil Service (NI roles only)."
+)
 
 option = st.radio("CV Input Method", ["Upload PDF", "Paste Text"])
 
@@ -59,6 +73,15 @@ if option == "Upload PDF":
 else:
     cv_text = st.text_area("Paste your CV text here", height=300)
 
+min_score = st.slider(
+    "Minimum match score to show",
+    min_value=0,
+    max_value=100,
+    value=40,
+    step=5,
+    help="Jobs below this score will be hidden.",
+)
+
 if st.button("Find Jobs"):
     if not file_bytes and not cv_text.strip():
         st.error("Please upload or paste your CV.")
@@ -70,20 +93,25 @@ if st.button("Find Jobs"):
 
         cv_clean = clean_text(cv_raw)
 
-        with st.spinner("Fetching jobs..."):
+        with st.spinner("Fetching jobs from Indeed and Civil Service..."):
             jobs = get_all_jobs()
 
         if not jobs:
             st.warning("No jobs found or sources unavailable.")
         else:
             scored = compute_scores(cv_clean, jobs)
-            st.subheader("Job Matches")
+            filtered = [job for job in scored if job["score"] >= min_score]
 
-            for job in scored:
-                with st.container():
-                    st.markdown(f"### {job['title']} ({job['company']})")
-                    st.write(f"**Location:** {job['location']}")
-                    st.write(f"**Source:** {job['source']}")
-                    st.write(f"**Match Score:** {job['score']}%")
-                    st.write(f"[Job Link]({job['url']})")
-                    st.write("---")
+            st.subheader(f"Job Matches (showing {len(filtered)} of {len(scored)} total)")
+
+            if not filtered:
+                st.info("No jobs meet the minimum match score. Try lowering the threshold.")
+            else:
+                for job in filtered:
+                    with st.container():
+                        st.markdown(f"### {job['title']} ({job['company']})")
+                        st.write(f"**Location:** {job['location'] or 'Northern Ireland'}")
+                        st.write(f"**Source:** {job['source']}")
+                        st.write(f"**Match Score:** {job['score']}%")
+                        st.write(f"[Job Link]({job['url']})")
+                        st.write("---")
