@@ -1,88 +1,81 @@
 # job_source.py
 
-import os
-import requests
-from bs4 import BeautifulSoup  # kept in case you want it later
 import feedparser
-
-ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID", "")
-ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY", "")
+import urllib.parse
 
 
-def get_adzuna_jobs():
-    """
-    Fetch jobs from Adzuna limited to Northern Ireland.
-    """
-    if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
-        return []
-
-    url = (
-        "https://api.adzuna.com/v1/api/jobs/gb/search/1"
-        f"?app_id={ADZUNA_APP_ID}"
-        f"&app_key={ADZUNA_APP_KEY}"
-        f"&where=northern%20ireland"
-        f"&results_per_page=50"
-        f"&content-type=application/json"
-    )
-
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        return []
-
+def _parse_indeed_feed(url):
+    feed = feedparser.parse(url)
     jobs = []
-    for item in data.get("results", []):
+
+    for entry in feed.entries:
+        title = entry.title
+        link = entry.link
+        summary = getattr(entry, "summary", "") or entry.get("summary", "")
+
+        # Indeed often includes location in the summary/title; keep it simple.
+        # We'll just tag these as "Northern Ireland" since feed is already NI-targeted.
+        location = "Northern Ireland"
+
         jobs.append(
             {
-                "title": item.get("title", "Unknown"),
-                "company": item.get("company", {}).get("display_name", "Unknown"),
-                "location": item.get("location", {}).get("display_name", "Northern Ireland"),
-                "salary": item.get("salary_min") or 0,
-                "description": item.get("description", ""),
-                "url": item.get("redirect_url", ""),
-                "source": "Adzuna",
+                "title": title,
+                "company": "Indeed",
+                "location": location,
+                "salary": 0,
+                "description": summary,
+                "url": link,
+                "source": "Indeed",
             }
         )
+
     return jobs
+
+
+def get_indeed_jobs_ni():
+    """
+    Fetch jobs from Indeed via RSS, scoped to Northern Ireland.
+    This uses the UK Indeed RSS endpoint with location 'Northern Ireland'.
+    """
+    base_url = "https://www.indeed.co.uk/rss"
+    params = {
+        "q": "",  # empty query = all jobs
+        "l": "Northern Ireland",
+    }
+    url = f"{base_url}?{urllib.parse.urlencode(params)}"
+    return _parse_indeed_feed(url)
 
 
 def get_civil_service_jobs_ni():
     """
-    Fetch Civil Service jobs via RSS and filter to Northern Ireland.
+    Fetch Civil Service jobs via UK-wide RSS, then filter to locations in Northern Ireland.
     """
     feed_url = "https://www.civilservicejobs.service.gov.uk/csr/index.cgi/rss"
 
-    try:
-        feed = feedparser.parse(feed_url)
-    except Exception:
-        return []
-
+    feed = feedparser.parse(feed_url)
     jobs = []
+
     for entry in feed.entries:
-        # Some feeds use custom fields; we guard with .get
+        # Location may appear as a custom field or inside the summary/title.
         location = getattr(entry, "location", "") or entry.get("location", "")
-        if not location:
-            # Sometimes location might be in the summary or title, but we keep it simple.
-            continue
-
-        if "northern ireland" not in location.lower():
-            continue
-
+        summary = getattr(entry, "summary", "") or entry.get("summary", "")
         title = entry.title
         link = entry.link
-        description = getattr(entry, "summary", "") or entry.get("summary", "")
+
+        text_for_location = " ".join([title, summary, location]).lower()
+
+        if "northern ireland" not in text_for_location and "belfast" not in text_for_location:
+            continue
 
         jobs.append(
             {
                 "title": title,
                 "company": "Civil Service",
-                "location": location,
-                "salary": 0,  # RSS doesn’t reliably expose salary
-                "description": description,
+                "location": location if location else "Northern Ireland",
+                "salary": 0,
+                "description": summary,
                 "url": link,
-                "source": "Civil Service NI",
+                "source": "Civil Service (UK-wide, NI roles)",
             }
         )
 
@@ -91,8 +84,9 @@ def get_civil_service_jobs_ni():
 
 def get_all_jobs():
     """
-    Combine Adzuna and Civil Service NI jobs.
+    Combine Indeed NI and Civil Service UK-wide (filtered to NI) jobs.
+    No API keys needed.
     """
-    adzuna_jobs = get_adzuna_jobs()
+    indeed_jobs = get_indeed_jobs_ni()
     civil_jobs = get_civil_service_jobs_ni()
-    return adzuna_jobs + civil_jobs
+    return indeed_jobs + civil_jobs
