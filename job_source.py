@@ -1,92 +1,18 @@
-# job_source.py
+import streamlit as st
 
-import feedparser
-import urllib.parse
+st.title("Job Sources")
 
+st.write("This app uses RSS feeds so it can run on Streamlit Cloud with no keys.")
 
-def _parse_indeed_feed(url):
-    feed = feedparser.parse(url)
-    jobs = []
+st.subheader("UK Civil Service (via Indeed RSS)")
+st.write(
+    "We pull Indeed RSS results filtered to links that come from the official Civil Service Jobs domain "
+    "and NI locations."
+)
+st.code("https://rss.indeed.com/rss?q=site:civilservicejobs.service.gov.uk+Belfast&l=Northern+Ireland")
 
-    for entry in feed.entries:
-        title = entry.title
-        link = entry.link
-        summary = getattr(entry, "summary", "") or entry.get("summary", "")
+st.subheader("Careerjet RSS")
+st.write("We pull Careerjet RSS for Northern Ireland and filter out NICS listings.")
+st.code("https://rss.careerjet.co.uk/rss?s=HMRC&l=Northern+Ireland&sort=date")
 
-        # Indeed often includes location in the summary/title; keep it simple.
-        # We'll just tag these as "Northern Ireland" since feed is already NI-targeted.
-        location = "Northern Ireland"
-
-        jobs.append(
-            {
-                "title": title,
-                "company": "Indeed",
-                "location": location,
-                "salary": 0,
-                "description": summary,
-                "url": link,
-                "source": "Indeed",
-            }
-        )
-
-    return jobs
-
-
-def get_indeed_jobs_ni():
-    """
-    Fetch jobs from Indeed via RSS, scoped to Northern Ireland.
-    This uses the UK Indeed RSS endpoint with location 'Northern Ireland'.
-    """
-    base_url = "https://www.indeed.co.uk/rss"
-    params = {
-        "q": "",  # empty query = all jobs
-        "l": "Northern Ireland",
-    }
-    url = f"{base_url}?{urllib.parse.urlencode(params)}"
-    return _parse_indeed_feed(url)
-
-
-def get_civil_service_jobs_ni():
-    """
-    Fetch Civil Service jobs via UK-wide RSS, then filter to locations in Northern Ireland.
-    """
-    feed_url = "https://www.civilservicejobs.service.gov.uk/csr/index.cgi/rss"
-
-    feed = feedparser.parse(feed_url)
-    jobs = []
-
-    for entry in feed.entries:
-        # Location may appear as a custom field or inside the summary/title.
-        location = getattr(entry, "location", "") or entry.get("location", "")
-        summary = getattr(entry, "summary", "") or entry.get("summary", "")
-        title = entry.title
-        link = entry.link
-
-        text_for_location = " ".join([title, summary, location]).lower()
-
-        if "northern ireland" not in text_for_location and "belfast" not in text_for_location:
-            continue
-
-        jobs.append(
-            {
-                "title": title,
-                "company": "Civil Service",
-                "location": location if location else "Northern Ireland",
-                "salary": 0,
-                "description": summary,
-                "url": link,
-                "source": "Civil Service (UK-wide, NI roles)",
-            }
-        )
-
-    return jobs
-
-
-def get_all_jobs():
-    """
-    Combine Indeed NI and Civil Service UK-wide (filtered to NI) jobs.
-    No API keys needed.
-    """
-    indeed_jobs = get_indeed_jobs_ni()
-    civil_jobs = get_civil_service_jobs_ni()
-    return indeed_jobs + civil_jobs
+st.caption("Note: We do NOT scrape Civil Service Jobs directly because it requires JavaScript and a 'Quick check' step.")
