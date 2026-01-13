@@ -1,7 +1,6 @@
 streamlit
 requests
-beautifulsoup4
 feedparser
-python-dateutil
+urllib3
 pypdf
 python-docx
