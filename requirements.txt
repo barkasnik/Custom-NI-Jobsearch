@@ -1,7 +1,5 @@
 streamlit
 scikit-learn
-nltk
 PyPDF2
 requests
-beautifulsoup4
 feedparser
