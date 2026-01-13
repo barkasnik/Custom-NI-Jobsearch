@@ -1,4 +1,7 @@
 streamlit
 requests
+beautifulsoup4
 feedparser
-scikit-learn
+python-dateutil
+pypdf
+python-docx
