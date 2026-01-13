@@ -1,133 +1,135 @@
 import streamlit as st
-from job_source import (
-    extract_text_from_upload,
-    fetch_all_jobs,
-    score_jobs,
-)
+from job_source import extract_text_from_upload, fetch_all_jobs, score_jobs
 
-st.set_page_config(page_title="NI Job Matcher (UK Civil Service)", layout="wide")
+st.set_page_config(page_title="NI UK Civil Service Job Matcher", layout="wide")
 
-st.title("NI Job Matcher (UK Civil Service roles)")
-st.caption(
-    "Matches your CV to UK Civil Service-style roles located in Northern Ireland. "
-    "No API keys. Runs on Streamlit Cloud."
-)
+BUILD = "2026-01-13 v6 (RSS-only, no NIJobs scraping, multi-profile scoring)"
+st.title("NI UK Civil Service Job Matcher")
+st.caption(f"BUILD: {BUILD}")
 
 with st.sidebar:
     st.subheader("Your CV")
-    uploaded = st.file_uploader(
-        "Upload CV (PDF, DOCX, TXT)",
-        type=["pdf", "docx", "txt"],
-        help="Uploading is optional — you can paste text instead.",
-    )
-    pasted = st.text_area(
-        "…or paste CV text",
-        height=220,
-        placeholder="Paste your CV / personal statement here…",
-    )
+    uploaded = st.file_uploader("Upload CV (PDF/DOCX/TXT)", type=["pdf", "docx", "txt"])
+    pasted = st.text_area("…or paste CV text", height=220, placeholder="Paste CV text here…")
 
     st.divider()
-    st.subheader("Filters")
-    min_score = st.slider("Minimum match score", 40, 95, 60, 1)
-    max_results = st.slider("Max results to show", 10, 100, 40, 5)
-    show_diagnostics = st.toggle("Show diagnostics", value=False)
+    st.subheader("Sources (RSS, key-free)")
+    use_careerjet = st.checkbox("Careerjet RSS (NI baseline)", value=True)
+    use_indeed = st.checkbox("Indeed RSS (often flaky)", value=True)
 
-# Resolve CV text
+    st.divider()
+    st.subheader("Filter")
+    strict_gov_only = st.checkbox("Prefer government / civil service-ish jobs", value=True)
+    extra_keywords = st.text_input("Optional keywords", placeholder="e.g. supervisor, operations, customer service, python")
+
+    st.divider()
+    st.subheader("Results")
+    min_score = st.slider("Minimum match score", 40, 95, 50, 1)
+    max_results = st.slider("Max results to show", 10, 100, 40, 5)
+    show_diagnostics = st.toggle("Show diagnostics", value=True)
+
+    st.divider()
+    if st.button("Clear cache"):
+        st.cache_data.clear()
+        st.success("Cache cleared.")
+
+# CV text (paste overrides upload)
 cv_text = ""
 if uploaded is not None:
     cv_text = extract_text_from_upload(uploaded)
-elif pasted.strip():
+if pasted.strip():
     cv_text = pasted.strip()
 
-# Button (main area, obvious)
-colA, colB = st.columns([1, 3])
-with colA:
-    run = st.button("Find matches", type="primary", use_container_width=True)
-with colB:
-    st.write("Tip: you can run it even without a CV — you’ll still get jobs, just less meaningful scoring.")
+run = st.button("Find matches", type="primary", use_container_width=True)
 
-# Session state flags
 if "searched" not in st.session_state:
-    st.session_state["searched"] = False
+    st.session_state.searched = False
 if "results" not in st.session_state:
-    st.session_state["results"] = []
+    st.session_state.results = []
 if "diag" not in st.session_state:
-    st.session_state["diag"] = {}
+    st.session_state.diag = {}
 
 if run:
-    st.session_state["searched"] = True
-    with st.spinner("Fetching jobs…"):
-        jobs, diag = fetch_all_jobs()
-    st.session_state["diag"] = diag
+    st.session_state.searched = True
+
+    with st.spinner("Fetching jobs (RSS)…"):
+        jobs, diag = fetch_all_jobs(
+            use_careerjet=use_careerjet,
+            use_indeed=use_indeed,
+            strict_gov_only=strict_gov_only,
+            extra_keywords=extra_keywords.strip(),
+        )
+        st.session_state.diag = diag
 
     with st.spinner("Scoring matches…"):
-        results = score_jobs(cv_text, jobs)
+        scored = score_jobs(cv_text, jobs)
 
-    # Apply UI filters
-    results = [r for r in results if r["score"] >= min_score]
-    results = results[:max_results]
+    # Filter by score, but never show “nothing” if we fetched jobs
+    filtered = [r for r in scored if r["score"] >= min_score]
+    if not filtered and scored:
+        filtered = scored[:20]
+        st.info("Nothing met your minimum score, so I’m showing the closest matches instead.")
 
-    st.session_state["results"] = results
+    st.session_state.results = filtered[:max_results]
 
-# --- Render state-aware output ---
-results = st.session_state["results"]
+st.divider()
+st.subheader("Results")
 
-if not st.session_state["searched"]:
-    st.info("Upload/paste your CV (optional), then click **Find matches**.")
+if not st.session_state.searched:
+    st.info("Paste/upload your CV (optional), then click **Find matches**.")
 else:
-    # Search has run
-    if not results:
-        st.warning(
-            "Search ran, but **0 results** passed your filters. "
-            "Try lowering **Minimum match score** in the sidebar."
-        )
+    counts = (st.session_state.diag.get("counts") or {})
+    fetched_total = counts.get("Deduped total", 0)
+
+    if fetched_total == 0:
+        st.error("0 jobs fetched from RSS feeds. Open Diagnostics below to see which feed failed.")
+    elif not st.session_state.results:
+        st.warning("Jobs were fetched, but none survived filters/scoring. Lower the minimum score.")
     else:
-        st.subheader(f"Matches ({len(results)})")
+        st.write(f"Showing **{len(st.session_state.results)}** matches (from **{fetched_total}** fetched).")
 
-        for r in results:
-            left, right = st.columns([3, 1])
+        for r in st.session_state.results:
+            with st.container(border=True):
+                cols = st.columns([4, 1])
+                with cols[0]:
+                    st.markdown(f"### [{r['title']}]({r['url']})")
+                    meta = []
+                    if r.get("company"):
+                        meta.append(r["company"])
+                    if r.get("location"):
+                        meta.append(r["location"])
+                    meta.append(f"Source: {r.get('source','')}")
+                    if r.get("profile"):
+                        meta.append(f"Matched via: {r['profile']}")
+                    st.write(" • ".join([m for m in meta if m]))
 
-            with left:
-                st.markdown(f"### [{r['title']}]({r['url']})")
-                meta = []
-                if r.get("company"):
-                    meta.append(r["company"])
-                if r.get("location"):
-                    meta.append(r["location"])
-                if r.get("source"):
-                    meta.append(f"Source: {r['source']}")
-                st.write(" • ".join(meta) if meta else "")
+                    if r.get("summary"):
+                        st.write(r["summary"])
 
-                if r.get("summary"):
-                    st.write(r["summary"])
+                    if r.get("why"):
+                        st.caption("Matched terms: " + ", ".join(r["why"][:12]))
 
-                if r.get("why"):
-                    st.caption("Matched on: " + ", ".join(r["why"][:10]))
+                with cols[1]:
+                    st.metric("Match", f"{r['score']}%")
+                    st.progress(r["score"] / 100)
 
-            with right:
-                st.metric("Match", f"{r['score']}%")
-                st.progress(r["score"] / 100)
-
-            st.divider()
-
-# --- Diagnostics ---
-if show_diagnostics and st.session_state["searched"]:
+if show_diagnostics and st.session_state.searched:
+    st.divider()
     st.subheader("Diagnostics")
-    diag = st.session_state.get("diag", {}) or {}
 
     st.write("**Counts**")
-    st.json(diag.get("counts", {}))
+    st.json(st.session_state.diag.get("counts", {}))
 
-    if diag.get("errors"):
+    if st.session_state.diag.get("feeds"):
+        st.write("**Feed checks** (status / entries)")
+        st.json(st.session_state.diag["feeds"])
+
+    if st.session_state.diag.get("errors"):
         st.write("**Errors**")
-        for e in diag["errors"]:
+        for e in st.session_state.diag["errors"]:
             st.code(e)
 
-    st.write("**Notes**")
-    st.write(
-        "- If a source shows 0, it may be temporarily blocking server requests.\n"
-        "- NIJobs is the primary source and should usually return items. "
-        "It lists 'Civil Service' jobs in Northern Ireland. :contentReference[oaicite:1]{index=1}\n"
-        "- The official Civil Service Jobs portal can be anti-bot protected, which is why apps often get 0 from it. "
-        ":contentReference[oaicite:2]{index=2}"
+    st.caption(
+        "If you still see NIJobs timeouts here, you are not running this build. "
+        "In Streamlit Cloud settings, make sure the main file is app.py, then Reboot."
     )
