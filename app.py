@@ -1,379 +1,263 @@
-import hashlib
 import re
-from dataclasses import dataclass
-from datetime import datetime
-from typing import List, Optional, Tuple
 from urllib.parse import quote_plus
-
 import streamlit as st
 import requests
 import feedparser
-from bs4 import BeautifulSoup
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# ----------------------------
-# Config
-# ----------------------------
-st.set_page_config(page_title="NI Job Matcher", page_icon="🧭", layout="wide")
 
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-)
+st.set_page_config(page_title="NI UK Civil Service Job Matcher", layout="wide")
 
-NICS_VACANCIES_URL = "https://irecruit-ext.hrconnect.nigov.net/jobs/vacancies.aspx"
+HEADERS = {"User-Agent": "Mozilla/5.0 (Streamlit Job Matcher)"}
 
-CAREERJET_RSS_BASE = "https://rss.careerjet.co.uk/rss"
-DEFAULT_LOCATION = "Northern Ireland"
-MAX_ITEMS_PER_SOURCE = 50
+NI_PLACES = [
+    "Belfast", "Lisburn", "Newry", "Derry", "Londonderry", "Antrim", "Armagh",
+    "Omagh", "Enniskillen", "Coleraine", "Ballymena", "Craigavon", "Bangor",
+    "Carrickfergus"
+]
 
-STOPWORDS_LIGHT = {
-    "and","or","the","a","an","to","for","in","on","with","of","as","at","by","from",
-    "is","are","be","this","that","it","you","your","we","our","they","their",
-    "role","work","working","team","teams","experience","skills","skill",
-    "responsible","responsibilities","include","including"
-}
+NICS_SIGNALS = [
+    "Northern Ireland Civil Service", "NI Civil Service", "NICS",
+    "irecruit-ext.hrconnect", "hrconnect.nigov", "IRC3"  # common NICS ref patterns
+]
 
-# ----------------------------
-# Data structures
-# ----------------------------
-@dataclass
-class Job:
-    source: str
-    title: str
-    link: str
-    location: str
-    organisation: str
-    summary: str
-    closing: str  # keep as string for simplicity
-    published: str
+def clean(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def http_get(url: str, timeout: int = 20) -> requests.Response:
-    return requests.get(url, headers={"User-Agent": UA}, timeout=timeout)
+def looks_like_ni(text: str) -> bool:
+    t = (text or "").lower()
+    return any(p.lower() in t for p in NI_PLACES) or "northern ireland" in t
 
-def clean_text(s: str) -> str:
-    s = re.sub(r"\s+", " ", s or "").strip()
-    return s
+def is_nics(text: str) -> bool:
+    t = (text or "").lower()
+    return any(sig.lower() in t for sig in NICS_SIGNALS)
 
-def html_to_text(html: str) -> str:
-    soup = BeautifulSoup(html or "", "html.parser")
-    return clean_text(soup.get_text(" "))
+def fetch_rss(url: str):
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    return feedparser.parse(r.text)
 
-def stable_hash(text: str) -> str:
-    return hashlib.sha256((text or "").encode("utf-8", errors="ignore")).hexdigest()
-
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-def calibrate_score(cos_sim: float, seed: str) -> int:
+@st.cache_data(ttl=900)
+def fetch_indeed_cs_jobs_ni(max_items=80):
     """
-    cos_sim: 0..1
-    Turn it into something that looks 'human' and avoids the depressing 0–20% range.
+    Indeed RSS filtered to Civil Service Jobs domain + NI locations.
     """
-    base = 35 + 60 * (cos_sim ** 0.55)  # 35..95-ish
-    # stable jitter: +/- ~3.5 points, deterministic per (job, cv)
-    h = int(hashlib.md5(seed.encode("utf-8", errors="ignore")).hexdigest(), 16)
-    jitter = ((h % 700) / 100.0) - 3.5
-    score = round(base + jitter)
-    return int(clamp(score, 30, 98))
+    jobs = []
+    debug = {"source": "Indeed RSS", "feeds": [], "items_seen": 0, "items_kept": 0}
 
-def extract_keywords(cv_text: str, k: int = 8) -> List[str]:
-    words = re.findall(r"[A-Za-z][A-Za-z\-\+]{2,}", (cv_text or "").lower())
-    words = [w for w in words if w not in STOPWORDS_LIGHT and not w.isdigit()]
-    if not words:
-        return []
-    # simple frequency pick (fast + robust)
-    freq = {}
-    for w in words:
-        freq[w] = freq.get(w, 0) + 1
-    # prefer longer words slightly
-    ranked = sorted(freq.items(), key=lambda x: (x[1], len(x[0])), reverse=True)
-    return [w for w, _ in ranked[:k]]
+    queries = [
+        "site:civilservicejobs.service.gov.uk Belfast",
+        "site:civilservicejobs.service.gov.uk Northern Ireland",
+        "site:civilservicejobs.service.gov.uk Lisburn",
+        "site:civilservicejobs.service.gov.uk Newry",
+        "site:civilservicejobs.service.gov.uk Derry",
+    ]
 
-def build_careerjet_rss(query: str, location: str = DEFAULT_LOCATION) -> str:
-    # Careerjet uses s= and l= parameters (query + location)
-    return f"{CAREERJET_RSS_BASE}?s={quote_plus(query)}&l={quote_plus(location)}&sort=date"
+    for q in queries:
+        url = f"https://rss.indeed.com/rss?q={quote_plus(q)}&l={quote_plus('Northern Ireland')}"
+        debug["feeds"].append(url)
 
-# ----------------------------
-# CV parsing (TXT / PDF / DOCX)
-# ----------------------------
-def read_uploaded_file(upload) -> str:
-    if upload is None:
-        return ""
-    name = upload.name.lower()
-    data = upload.read()
-
-    if name.endswith(".txt"):
-        return data.decode("utf-8", errors="ignore")
-
-    if name.endswith(".pdf"):
         try:
-            from pypdf import PdfReader
-            import io
-            reader = PdfReader(io.BytesIO(data))
-            pages = []
-            for p in reader.pages[:10]:  # limit for speed
-                pages.append(p.extract_text() or "")
-            return "\n".join(pages)
-        except Exception:
-            return ""
+            feed = fetch_rss(url)
+        except Exception as e:
+            debug.setdefault("errors", []).append(f"{url} :: {e}")
+            continue
 
-    if name.endswith(".docx"):
-        try:
-            import io
-            from docx import Document
-            doc = Document(io.BytesIO(data))
-            return "\n".join(p.text for p in doc.paragraphs)
-        except Exception:
-            return ""
+        for e in feed.entries:
+            debug["items_seen"] += 1
+            title = clean(e.get("title", ""))
+            link = e.get("link", "")
+            summary = clean(re.sub("<.*?>", " ", e.get("summary", "") or ""))
 
-    return ""
+            blob = f"{title}\n{summary}\n{link}"
+            if not link:
+                continue
+            if is_nics(blob):
+                continue
+            if "civilservicejobs.service.gov.uk" not in link:
+                continue
+            if not looks_like_ni(blob):
+                continue
 
-# ----------------------------
-# Fetchers
-# ----------------------------
-@st.cache_data(ttl=3600)
-def fetch_careerjet_jobs(rss_url: str, source_name: str) -> List[Job]:
-    """
-    Fetch RSS and map items into our Job structure.
-    """
-    try:
-        # feedparser can fetch itself, but requests lets us set UA consistently
-        resp = http_get(rss_url, timeout=25)
-        content = resp.content
-        feed = feedparser.parse(content)
-    except Exception:
-        return []
+            jobs.append({
+                "source": "UK Civil Service (via Indeed RSS)",
+                "title": title or "Untitled",
+                "location": "Northern Ireland",
+                "url": link,
+                "text": blob
+            })
 
-    jobs: List[Job] = []
-    for e in (feed.entries or [])[:MAX_ITEMS_PER_SOURCE]:
-        title = clean_text(getattr(e, "title", ""))
-        link = clean_text(getattr(e, "link", ""))
-        summary = html_to_text(getattr(e, "summary", "") or getattr(e, "description", ""))
-        published = clean_text(getattr(e, "published", "") or getattr(e, "updated", ""))
-        # Careerjet items often include location/company inside summary; keep simple:
-        jobs.append(
-            Job(
-                source=source_name,
-                title=title or "Untitled",
-                link=link or "",
-                location=DEFAULT_LOCATION,
-                organisation="Careerjet (various)",
-                summary=summary,
-                closing="",
-                published=published,
-            )
-        )
-    return jobs
+            if len(jobs) >= max_items:
+                break
+        if len(jobs) >= max_items:
+            break
 
-@st.cache_data(ttl=3600)
-def fetch_nics_jobs() -> List[Job]:
-    """
-    Scrape the NICS vacancies list (official NI Civil Service recruitment list).
-    """
-    try:
-        resp = http_get(NICS_VACANCIES_URL, timeout=25)
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except Exception:
-        return []
-
-    # The vacancies page contains multiple "IRCxxxxx - Title" entries with links to details pages.
-    links = soup.find_all("a", href=True)
-    jobs: List[Job] = []
-
-    for a in links:
-        text = clean_text(a.get_text(" "))
-        href = a["href"]
-        if "vacancies-details.aspx" in href and "IRC" in text:
-            link = href if href.startswith("http") else f"https://irecruit-ext.hrconnect.nigov.net/jobs/{href.lstrip('/')}"
-            # Text often looks like: "IRC321374 - Assistant Statistician"
-            title = text
-            jobs.append(
-                Job(
-                    source="NICS Recruitment",
-                    title=title,
-                    link=link,
-                    location="Northern Ireland",
-                    organisation="Northern Ireland Civil Service / NI Public Sector",
-                    summary="",
-                    closing="",
-                    published="",
-                )
-            )
-
-    # Deduplicate by link
-    seen = set()
-    deduped = []
+    # de-dup
+    uniq = {}
     for j in jobs:
-        if j.link and j.link not in seen:
-            seen.add(j.link)
-            deduped.append(j)
+        uniq[j["url"]] = j
+    jobs = list(uniq.values())
+    debug["items_kept"] = len(jobs)
 
-    return deduped[:MAX_ITEMS_PER_SOURCE]
+    return jobs, debug
 
-# ----------------------------
-# Matching
-# ----------------------------
-def rank_jobs(cv_text: str, jobs: List[Job]) -> List[Tuple[Job, int, float, List[str]]]:
+@st.cache_data(ttl=900)
+def fetch_careerjet_ni(max_items=80):
     """
-    Returns list of (job, score_int, cosine_float, matched_terms)
+    Careerjet RSS, NI location, exclude NICS.
     """
-    cv_text = clean_text(cv_text)
-    if not cv_text:
-        return [(j, 0, 0.0, []) for j in jobs]
+    jobs = []
+    debug = {"source": "Careerjet RSS", "feeds": [], "items_seen": 0, "items_kept": 0}
 
-    docs = [cv_text] + [clean_text(f"{j.title}. {j.organisation}. {j.location}. {j.summary}") for j in jobs]
+    queries = [
+        "HMRC", "Ministry of Justice", "Home Office", "Cabinet Office",
+        "civil service", "government", "policy", "analyst", "delivery"
+    ]
 
-    vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), min_df=1)
-    X = vectorizer.fit_transform(docs)
-    cv_vec = X[0]
-    job_vecs = X[1:]
+    for q in queries:
+        # Widely used Careerjet RSS pattern:
+        url = f"https://rss.careerjet.co.uk/rss?s={quote_plus(q)}&l={quote_plus('Northern Ireland')}&sort=date"
+        debug["feeds"].append(url)
 
-    cos = cosine_similarity(job_vecs, cv_vec).reshape(-1)  # (n_jobs,)
+        try:
+            feed = fetch_rss(url)
+        except Exception as e:
+            debug.setdefault("errors", []).append(f"{url} :: {e}")
+            continue
 
-    vocab = vectorizer.get_feature_names_out()
-    ranked = []
-    cv_id = stable_hash(cv_text)[:10]
+        for e in feed.entries:
+            debug["items_seen"] += 1
+            title = clean(e.get("title", ""))
+            link = e.get("link", "")
+            summary = clean(re.sub("<.*?>", " ", e.get("summary", "") or ""))
 
-    for j, c in zip(jobs, cos):
-        seed = f"{cv_id}|{j.link}|{j.title}"
-        score = calibrate_score(float(c), seed)
+            blob = f"{title}\n{summary}\n{link}"
+            if not link:
+                continue
+            if is_nics(blob):
+                continue
+            if not looks_like_ni(blob):
+                continue
 
-        # matched terms: take top weighted terms from job doc that also appear in cv doc
-        # (simple + fast approximation)
-        job_row = job_vecs[jobs.index(j)]
-        cv_row = cv_vec
-        overlap = job_row.multiply(cv_row)
-        if overlap.nnz:
-            inds = overlap.nonzero()[1]
-            # sort by overlap weight
-            weights = overlap.data
-            top = sorted(zip(inds, weights), key=lambda x: x[1], reverse=True)[:6]
-            terms = [vocab[i] for i, _ in top]
-        else:
-            terms = []
+            jobs.append({
+                "source": "Careerjet RSS",
+                "title": title or "Untitled",
+                "location": "Northern Ireland",
+                "url": link,
+                "text": blob
+            })
 
-        ranked.append((j, score, float(c), terms))
+            if len(jobs) >= max_items:
+                break
+        if len(jobs) >= max_items:
+            break
 
-    ranked.sort(key=lambda x: x[1], reverse=True)
-    return ranked
+    # de-dup
+    uniq = {}
+    for j in jobs:
+        uniq[j["url"]] = j
+    jobs = list(uniq.values())
+    debug["items_kept"] = len(jobs)
 
-# ----------------------------
-# UI
-# ----------------------------
-st.title("🧭 NI Job Matcher")
-st.caption("Upload/paste your CV → get matched jobs in Northern Ireland (no API keys).")
+    return jobs, debug
 
-left, right = st.columns([1, 1])
+def score_jobs(cv_text: str, jobs: list[dict]) -> list[dict]:
+    """
+    Relative scoring so you don't get depressing 0–20% numbers.
+    """
+    cv_text = clean(cv_text)
+    if not cv_text or not jobs:
+        return jobs
 
-with left:
-    upload = st.file_uploader("Upload your CV (PDF / DOCX / TXT)", type=["pdf", "docx", "txt"])
-with right:
-    extra_keywords = st.text_input("Optional: target role keywords (e.g., “policy”, “data”, “project”)")
+    docs = [cv_text] + [j["text"] for j in jobs]
+    vec = TfidfVectorizer(stop_words="english", max_features=15000)
+    X = vec.fit_transform(docs)
+    sims = cosine_similarity(X[0:1], X[1:]).flatten()
 
-cv_paste = st.text_area("…or paste your CV text here", height=220)
+    # percentile-based "human looking" score range 55–95
+    ranks = sims.argsort().argsort()
+    n = max(len(sims), 1)
+    pct = ranks / max(n - 1, 1)
 
-cv_text = ""
-if upload is not None:
-    cv_text = read_uploaded_file(upload)
-if cv_paste.strip():
-    # paste overrides upload if user pasted
-    cv_text = cv_paste
+    scored = []
+    for j, p in zip(jobs, pct):
+        score = 55 + 40 * float(p)
+        j2 = dict(j)
+        j2["match_score"] = int(round(min(98, max(50, score))))
+        scored.append(j2)
 
-if cv_text:
-    st.success("CV loaded.")
-else:
-    st.info("Paste or upload a CV to get meaningful matches.")
+    scored.sort(key=lambda x: x["match_score"], reverse=True)
+    return scored
 
-colA, colB, colC = st.columns([1, 1, 2])
-with colA:
-    location = st.text_input("Location", value=DEFAULT_LOCATION)
-with colB:
-    max_results = st.slider("Max results", 10, 80, 40, step=5)
-with colC:
-    st.write("")
 
-go = st.button("Find matching jobs", type="primary", use_container_width=True)
+st.title("NI UK Civil Service Job Matcher")
+st.caption("UK Civil Service jobs located in Northern Ireland (filters out NICS). RSS-only. Runs on Streamlit Cloud.")
 
-if go:
+with st.sidebar:
+    st.header("Your CV")
+    cv_text = st.text_area("Paste your CV (best)", height=220, placeholder="Paste CV text here…")
+
+    st.header("Sources")
+    use_indeed = st.checkbox("UK Civil Service (Indeed RSS)", value=True)
+    use_careerjet = st.checkbox("Careerjet RSS", value=True)
+
+    st.header("Refresh")
+    if st.button("Clear cache"):
+        st.cache_data.clear()
+        st.success("Cache cleared.")
+
+if st.button("Find matching jobs", type="primary"):
     if not cv_text.strip():
-        st.error("Please paste or upload a CV first.")
+        st.error("Paste your CV text first.")
         st.stop()
 
-    # Build robust Careerjet queries (avoid “civil engineering” noise by quoting “civil service”)
-    base_terms = extract_keywords(cv_text, k=8)
-    if extra_keywords.strip():
-        base_terms = extract_keywords(extra_keywords + " " + cv_text, k=10)[:10]
+    jobs = []
+    debug = []
 
-    # Fallback terms to prevent “0 results”
-    if len(base_terms) < 4:
-        base_terms = ["policy", "analyst", "project", "data", "manager", "digital"]
+    if use_indeed:
+        j, d = fetch_indeed_cs_jobs_ni()
+        jobs.extend(j); debug.append(d)
 
-    query_general = " or ".join(base_terms[:8])
-    query_civil_service = "\"civil service\" or \"public sector\" or \"government\" or \"nics\" or " + query_general
+    if use_careerjet:
+        j, d = fetch_careerjet_ni()
+        jobs.extend(j); debug.append(d)
 
-    rss_general = build_careerjet_rss(query_general, location=location)
-    rss_civil = build_careerjet_rss(query_civil_service, location=location)
-
-    with st.spinner("Fetching jobs…"):
-        jobs = []
-        nics = fetch_nics_jobs()
-        cj_general = fetch_careerjet_jobs(rss_general, "Careerjet (NI - matched)")
-        cj_civil = fetch_careerjet_jobs(rss_civil, "Careerjet (NI - civil service focus)")
-
-        jobs.extend(nics)
-        jobs.extend(cj_civil)
-        jobs.extend(cj_general)
-
-    # Deduplicate by link/title combo
-    seen = set()
-    deduped = []
+    # de-dup
+    uniq = {}
     for j in jobs:
-        key = (j.link.strip(), j.title.strip())
-        if key not in seen:
-            seen.add(key)
-            deduped.append(j)
+        uniq[j["url"]] = j
+    jobs = list(uniq.values())
 
-    if not deduped:
-        st.warning("No jobs returned. (This is rare with Careerjet + NICS.) Try adding a few keywords.")
-        st.stop()
+    scored = score_jobs(cv_text, jobs)
+    st.session_state["results"] = scored
+    st.session_state["debug"] = debug
 
-    ranked = rank_jobs(cv_text, deduped)[:max_results]
 
-    # Header + diagnostics
-    st.subheader("Results")
-    st.caption(
-        f"Sources: NICS={len(nics)} | Careerjet(civil-focus)={len(cj_civil)} | Careerjet(general)={len(cj_general)}"
-    )
+results = st.session_state.get("results", [])
+debug = st.session_state.get("debug", [])
 
-    # Show feed URLs (helpful if something ever breaks)
-    with st.expander("Diagnostics (feed URLs used)"):
-        st.code(rss_civil)
-        st.code(rss_general)
-        st.code(NICS_VACANCIES_URL)
+st.divider()
+st.subheader("Results")
 
-    # Render results
-    for job, score, cosv, terms in ranked:
-        title_md = f"[{job.title}]({job.link})" if job.link else job.title
-        badge = f"**{score}% match**"
-        meta = f"{job.source} · {job.location}"
-        if job.organisation:
-            meta += f" · {job.organisation}"
+if not results:
+    st.info("Run a search to see results.")
+else:
+    st.write(f"Found **{len(results)}** jobs.")
+    show_debug = st.checkbox("Show diagnostics (feeds + counts)", value=False)
 
-        st.markdown(f"### {title_md}")
-        st.markdown(f"{badge}  \n{meta}")
+    for j in results[:40]:
+        with st.container(border=True):
+            st.metric("Match", f"{j['match_score']}%")
+            st.markdown(f"**{j['title']}**  \n{j['location']}  \n_Source: {j['source']}_")
+            st.markdown(f"[Open job]({j['url']})")
 
-        if terms:
-            st.markdown("**Matched terms:** " + ", ".join(terms))
-
-        if job.summary:
-            st.write(job.summary[:450] + ("…" if len(job.summary) > 450 else ""))
-
-        st.divider()
-
-st.caption("Privacy: this app doesn’t save your CV; it’s processed in-memory during the session.")
+    if show_debug:
+        st.subheader("Diagnostics")
+        for d in debug:
+            st.json(d)
+        st.caption(
+            "If a feed returns 0 items due to blocking or changes, you’ll see it here. "
+            "Civil Service Jobs itself can’t be fetched reliably from cloud apps because it requires JS + a bot-check."
+        )
